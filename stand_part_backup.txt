@@ -1,0 +1,173 @@
+import pandas as pd
+import pandas_gbq
+import rapidfuzz
+import uuid
+import datetime 
+from google.cloud import storage
+from google.cloud import bigquery
+import numpy as np
+import warnings
+import fsspec
+import gcsfs
+from dateutil import parser
+import datetime
+  
+pd.options.mode.chained_assignment = None  
+warnings.simplefilter("ignore", category=FutureWarning) 
+
+
+def standardize_EXTERNAL_PARTNER_part(ignored_input):
+    #get current month
+    today = datetime.date.today()
+    #above is class int
+    client = storage.Client('test-2-408522')
+    #above creates client to interface with GCS in specified project
+    most_recent_participant_file = None
+    for blob in client.list_blobs('sc2_north_lawndale', prefix='Archive/TEST'):
+        #above runs through all objects in specified path
+        #print(blob)
+        try:
+            if today.year == int(blob.name[-12:-8]) and today.month == int(blob.name[-8:-6]) and today.day == int(blob.name[-6:-4]) and 'EXTERNAL_PARTNER_PARTICIPANTS' in blob.name:
+                most_recent_participant_file = blob.name
+                break
+        except:
+            continue
+    #print('gs://sc2_north_lawndale/'+most_recent_participant_file)
+    #intentionally not accounting for scenario where file is uploaded by naming convention is not followed so an error is thrown
+    df = pd.read_csv('gs://sc2_north_lawndale/'+most_recent_participant_file)
+    #below for testing purposes
+    #have the pipeline automatically create a table to test if upload to folder tirggers pipeline correctly
+    #print(df)
+    #bucket.blob('Archive/TEST.csv').upload_from_string(final_non_dup.to_csv(), 'text/csv')
+    
+    # edits to be made in order
+    #set df to subset of only columns needed for creation of final table
+    df = df[['First Name','Last Name','Preferred Language','Contact ID','Address','NLC Code','Birthdate','Gender/ Gender Identity','Race','Zip/Postal Code','Ethnicity','Participant Enrolled/Assistance Start','Currently employed','Highest level of education so far?','Housing','Age at Intake']]
+    #rename cols to match final column names
+    try:
+        df.rename(columns={'First Name':'FIRST_NAME',
+                            'Last Name':'LAST_NAME',
+                            'Preferred Language':'LANGUAGE',
+                            'Contact ID':'EXTERNAL_PARTNER_ID',
+                            'Address':'ADDRESS',
+                            'Birthdate':'BIRTHDATE',
+                            'Zip/Postal Code':'ZIP_CODE',
+                            'Ethnicity':'ETHNICITY',
+                            'Participant Enrolled/Assistance Start':'EXTERNAL_PARTNER_COMMENCEMENT_DATE',
+                            'Currently employed':'EMPLOYMENT_STATUS',
+                            'Highest level of education so far?':'EDUCATION_LEVEL',
+                            'Housing':'HOUSING_LIVING_ARRANGEMENT',
+                            'Age at Intake':'AGE_AT_INTAKE',
+                            'Gender/ Gender Identity':'GENDER',
+                            'Race':'RACE',
+                            'Ethnicity':'ETHNICITY',
+                            'NLC Code':'DASHBOARD_GROUP_CODE'},inplace=True)
+    except KeyError as e:
+            # If the expected columns are not found, print an error and exit the function
+            print(f"Error: {e}")
+            mark_file_as_processed(bigquery_client, file_name, 'FAILURE: Inccorect Scehma')
+            return
+
+    # Filter out rows where 'Record ID' is empty or null
+    df = df[df['EXTERNAL_PARTNER_ID'].notna() & (df['EXTERNAL_PARTNER_ID'] != '')]  
+
+    #grab current date
+    todays_date = datetime.datetime.today()
+    
+    #create columns needed for later operations and for final table
+    df['SOURCE'] = 'EXTERNAL_PARTNER'
+    df['EXTERNAL_PARTNER'] = 'Y'
+    df['FROM_DATE'] = str(todays_date.year)+'-'+str(todays_date.month)+'-'+str(todays_date.day)
+    df['TO_DATE'] = '3000-01-01'
+
+    #Format date columns to 'YYYY-MM-DD' (format needed for BQ)
+    df['EXTERNAL_PARTNER_COMMENCEMENT_DATE'] = df['EXTERNAL_PARTNER_COMMENCEMENT_DATE'].apply(format_date)
+    df['BIRTHDATE'] = df['BIRTHDATE'].apply(format_date)
+    df['FROM_DATE'] = df['FROM_DATE'].apply(format_date)
+    df['TO_DATE'] = df['TO_DATE'].apply(format_date)
+
+    # Check for any unformatted dates and handle
+    if df['EXTERNAL_PARTNER_COMMENCEMENT_DATE'].isnull().any() or df['BIRTHDATE'].isnull().any():
+        print("One or more dates could not be formatted.")
+        mark_file_as_processed(bigquery_client, file_name,'FAILURE: Unrecognized Date Format')
+        return
+    
+    #generate participant current age
+    df['AGE'] = (todays_date - pd.to_datetime(df['BIRTHDATE'],format='%Y-%m-%d')).dt.days/365.25
+    df['AGE'] = df['AGE'].astype(int)
+
+    #create bq client to grab data from reference tables
+    client_BQ = bigquery.Client('test-2-408522')
+
+    #grab data from gender table to cross ref
+    gender_query = """
+            SELECT *
+            FROM test-2-408522.Standardized_Data.Ref_Data_Gender
+    """
+    standardized_gender_data = client_BQ.query(gender_query).to_dataframe()
+    #merge the dataframes on the source column and the relevant demographic column, this will add the column STANDARD_VALUE
+    df = df.merge(standardized_gender_data,how ='left',on = ['SOURCE','GENDER'])
+    df.drop(columns = 'GENDER',inplace = True)
+    df.rename(columns = {'STANDARD_VALUE':'GENDER'},inplace = True)
+
+    #grab data from race table to cross ref
+    race_query = """
+            SELECT *
+            FROM test-2-408522.Standardized_Data.Ref_Data_Race
+    """
+    standardized_race_data = client_BQ.query(race_query).to_dataframe()
+    #merge the dataframes on the source column and the relevant demographic column, this will add the column STANDARD_VALUE
+    df = df.merge(standardized_race_data,how ='left',on = ['SOURCE','RACE'])
+    df.drop(columns = 'RACE',inplace = True)
+    df.rename(columns = {'STANDARD_VALUE':'RACE'},inplace = True)
+
+    #grab data from ethnicty table to cross ref
+    ethnicity_query = """
+            SELECT *
+            FROM test-2-408522.Standardized_Data.Ref_Data_Ethnicity
+    """
+    standardized_ethnicity_data = client_BQ.query(ethnicity_query).to_dataframe()
+    #merge the dataframes on the source column and the relevant demographic column, this will add the column STANDARD_VALUE
+    df = df.merge(standardized_ethnicity_data,how ='left',on = ['SOURCE','ETHNICITY'])
+    df.drop(columns = 'ETHNICITY',inplace = True)
+    df.rename(columns = {'STANDARD_VALUE':'ETHNICITY'},inplace = True)
+
+    #grab data from group table to cross ref
+    #currently copying what the current cross ref with the group table is, but will likely need to be changed in the future per jeicy's corrections to the group table
+    group_query = """
+            SELECT *
+            FROM test-2-408522.unified_dashboard_nlc_dataset.GROUP
+    """
+    standardized_group_data = client_BQ.query(group_query).to_dataframe()
+    standardized_group_data = standardized_group_data[['DASHBOARD_GROUP_CODE','ID']]
+    df = df.merge(standardized_group_data,how ='left',on = ['DASHBOARD_GROUP_CODE'])
+    df.drop(columns = 'DASHBOARD_GROUP_CODE',inplace = True)
+    df.rename(columns = {'ID':'GROUP_AFFILIATION'},inplace = True)
+    
+    df.drop(columns = 'SOURCE',inplace = True)
+
+    client_storage = storage.Client('test-2-408522')
+    bucket = client_storage.get_bucket('sc2_north_lawndale')
+    bucket.blob('Archive/TEST.csv').upload_from_string(df.to_csv(), 'text/csv')
+    
+
+    #crossref group affl
+
+    #rename columns
+
+
+def format_date(date_str, placeholder="1900-01-01"):
+    """Thomas's function that standardizes date format to match the needed format in BQ YYY-mm-dd"""
+    try:
+        # Automatically parse the date using dateutil's parser
+
+        if pd.isna(date_str):
+            return placeholder  # Return None if the date is missing
+
+        date_str = date_str.strip()
+        parsed_date = parser.parse(date_str)
+        return parsed_date.strftime('%Y-%m-%d')
+    except Exception as e:
+        # Handle exceptions if the date format is unrecognized
+        print(f"Error parsing date: {date_str}, Error: {str(e)}")
+        return
